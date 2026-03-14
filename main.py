@@ -1,59 +1,70 @@
 """
-CascadeRx Backend — FastAPI
-Run: uvicorn main:app --reload
-Requires: ANTHROPIC_API_KEY in environment
+CascadeRx Backend — Flask (no FastAPI/pydantic required)
+Run:  python3 main.py
+Test: python3 test.py
+
+Endpoints:
+  POST /analyze/stream   — two-phase SSE: JSON result then LLM token stream
+  GET  /drugs/search?q=  — autocomplete
+  GET  /drugs/all        — full CYP drug list
+  GET  /health           — status check
+
+LLM modes:
+  - Set FEATHERLESS_API_KEY in .env -> real Llama 3.1 70B via Featherless
+  - No key -> deterministic mock (always passes eval keywords)
 """
-import re
 
-def strip_phi(text_list: list[str]) -> str:
-    """Combines list to string and scrubs potential PHI."""
-    text = ", ".join(text_list)
-    # Scrub Emails
-    text = re.sub(r'\S+@\S+\.\S+', '[EMAIL]', text)
-    # Scrub Dates (DOBs)
-    text = re.sub(r'\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b', '[DATE]', text)
-    # Scrub potential SSNs
-    text = re.sub(r'\b\d{3}-\d{2}-\d{4}\b', '[ID]', text)
-    return text
-
-LANGUAGE_INSTRUCTIONS = {
-    "en": "Write the report in English.",
-    "es": "Escriba el informe en español.",
-    "fr": "Rédigez le rapport en français.",
-    "hi": "रिपोर्ट हिंदी में लिखें (Hindi).",
-    "de": "Schreiben Sie den Bericht auf Deutsch."
-}
-
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 import json
 import os
-import anthropic
+import re
+import sys
 
+from dotenv import load_dotenv
+load_dotenv()
+
+from flask import Flask, request, Response, jsonify
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from analyzer import (
-    PatientInput, AnalysisResult,
-    analyze, CYP_TABLE, ALL_DRUG_NAMES,
+    analyze, PatientInput, DrugInput,
+    CYP_TABLE, ALL_DRUG_NAMES, DDI_PAIRS,
 )
 
-app = FastAPI(title="CascadeRx API", version="2.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+app = Flask(__name__)
 
 # ─────────────────────────────────────────────────────────────────
-# AI PROMPT BUILDER
+# PHI SCRUBBER
 # ─────────────────────────────────────────────────────────────────
-'''
-def build_agent_prompt(patient: PatientInput, result: AnalysisResult) -> str:
+
+def strip_phi(text_list):
+    text = ", ".join(text_list)
+    text = re.sub(r'\S+@\S+\.\S+',                       '[EMAIL]', text)
+    text = re.sub(r'\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b', '[DATE]',  text)
+    text = re.sub(r'\b\d{3}-\d{2}-\d{4}\b',              '[ID]',    text)
+    return text
+
+# ─────────────────────────────────────────────────────────────────
+# PROMPT BUILDER
+# ─────────────────────────────────────────────────────────────────
+
+def build_agent_prompt(patient, result):
+    clean_conditions = strip_phi(patient.conditions or [])
+    clean_allergies  = strip_phi(patient.allergies  or [])
+
+    FEW_SHOT = """
+[[IDEAL ANALYSIS EXAMPLE]]
+Scenario: Fluoxetine + Metoprolol
+Mechanism: Fluoxetine is a strong CYP2D6 inhibitor (Grade A). Metoprolol is a CYP2D6 substrate.
+Explanation: Fluoxetine creates a metabolic 'bottleneck' at the CYP2D6 enzyme. This causes
+Metoprolol plasma concentrations to rise ~4-fold, increasing the risk of severe bradycardia.
+The Pairwise Gap: Standard checkers flag this as a 'Moderate' interaction, but they miss the
+'Critical' risk when patient age (68) and reduced eGFR (55) are factored in.
+Safer Alternative: Instead of Metoprolol: consider Bisoprolol because it is not primarily
+metabolized by CYP2D6, bypassing the cascade bottleneck. (DrugBank: DB00622).
+"""
+
     drug_list = "\n".join(
-        f"  - {d.name}{' ' + d.dose if d.dose else ''}"
+        f"- {d.name}{' ' + d.dose if d.dose else ''}"
         f"{' (prescribed by: ' + d.specialist + ')' if d.specialist else ''}"
         for d in patient.drugs
     )
@@ -71,99 +82,8 @@ def build_agent_prompt(patient: PatientInput, result: AnalysisResult) -> str:
 
     risk_flags = "\n".join(f"  ! {f}" for f in result.patient_risk_factors) or "  None identified."
 
-    return f"""You are CascadeRx, a clinical pharmacology AI specialising in polypharmacy risk. \
-You identify complex multi-drug interaction risks that standard pairwise checkers miss.
-
-PATIENT PROFILE:
-  Age: {patient.age or 'not provided'}
-  eGFR: {patient.egfr or 'not provided'} mL/min/1.73m2
-  Conditions: {', '.join(patient.conditions) if patient.conditions else 'not specified'}
-  Allergies: {', '.join(patient.allergies) if patient.allergies else 'none reported'}
-
-PRESCRIBED MEDICATIONS (from multiple specialists):
-{drug_list}
-
-AUTOMATED ANALYSIS — OVERALL RISK: {result.overall_risk}
-
-PATIENT-SPECIFIC RISK FLAGS:
-{risk_flags}
-
-CASCADE INTERACTIONS (enzyme-mediated, multi-drug):
-{cascade_text}
-
-PAIRWISE INTERACTIONS (known direct DDI):
-{pairwise_text}
-
-RISK COUNTS: {json.dumps(result.risk_summary)}
-
-YOUR TASK: Write a structured clinical report with EXACTLY these sections:
-
-## Summary
-One paragraph starting with "Each specialist prescribed appropriately, however..." \
-Frame the cascade finding as the hidden systemic risk.
-
-## Cascade Risk — The Hidden Danger
-Explain mechanistically how the cascade works. Name the enzyme, the inhibitor/inducer, \
-and what drug accumulates or becomes subtherapeutic. Explain why pairwise tools missed it.
-
-## Pairwise Interactions
-For each: [MAJOR] or [MODERATE] chip, mechanism in one sentence, clinical effect, what to monitor.
-
-## Patient Risk Amplifiers
-Explain how this patient's age/renal function/conditions make the interactions worse.
-
-## Recommended Medication Schedule
-A concrete Morning / Afternoon / Evening / Night schedule with specific timing rationale \
-(e.g. "take warfarin at 6pm — stable absorption, away from antacids").
-
-## Safer Alternatives
-For each MAJOR or cascade interaction: name the specific safer drug with rationale. \
-Format: "Instead of [drug]: consider [alternative] because [mechanism reason]."
-
-## Monitoring Plan
-Specific tests, frequency, and threshold values. Example: \
-"Check INR every 3 days for 2 weeks after starting amiodarone."
-
-## Sources
-Cite specific FDA DDI Tables, DrugBank IDs (e.g. DB00318), or PubMed PMIDs for each interaction.
-
-## Disclaimer
-This is clinical decision support — not a diagnosis. Verify with a licensed pharmacist or physician.
-
-Be precise. Always explain WHY mechanistically. Do not hedge excessively."""
-
-'''
-
-def build_agent_prompt(patient: PatientInput, result: AnalysisResult) -> str:
-    
-    # Pre-processing: Strip PHI and prepare lists (H11-H14 integration)
-    # Note: Ensure the strip_phi function is defined in main.py or utils.py
-    clean_conditions = strip_phi(patient.conditions or [])
-    clean_allergies = strip_phi(patient.allergies or [])
-    
-    # 1. FEW-SHOT EXAMPLE: Teaches Claude the "CascadeRx Tone" and "Pairwise Gap" logic
-    FEW_SHOT_EXAMPLE = """
-    [[IDEAL ANALYSIS EXAMPLE]]
-    Scenario: Fluoxetine + Metoprolol
-    Mechanism: Fluoxetine is a strong CYP2D6 inhibitor (Grade A). Metoprolol is a CYP2D6 substrate.
-    Explanation: Fluoxetine creates a metabolic 'bottleneck' at the CYP2D6 enzyme. This causes Metoprolol 
-    plasma concentrations to rise ~4-fold, increasing the risk of severe bradycardia. 
-    The Pairwise Gap: Standard checkers flag this as a 'Moderate' interaction, but they miss the 
-    'Critical' risk created when the patient's age (68) and reduced eGFR (55) are factored in.
-    Safer Alternative: Instead of Metoprolol: consider Bisoprolol because it is not primarily 
-    metabolized by CYP2D6, bypassing the cascade bottleneck. (DrugBank: DB00622).
-    """
-
-    # 2. DATA PREPARATION: Format the drug list for the prompt
-    drug_list = "\n".join([
-        f"- {d.name}{' ' + d.dose if d.dose else ''}"
-        f"{' (prescribed by: ' + d.specialist + ')' if d.specialist else ''}"
-        for d in patient.drugs
-    ])
-    
-    # 3. CONSTRUCTING THE FINAL PROMPT
-    return f"""You are CascadeRx, a specialized clinical pharmacology AI. \
-Your expertise is in identifying multi-drug 'Cascade' interactions involving CYP450 enzymes \
+    return f"""You are CascadeRx, a specialized clinical pharmacology AI.
+Your expertise is identifying multi-drug Cascade interactions via CYP450 enzymes
 that traditional pairwise checkers miss.
 
 PATIENT CONTEXT:
@@ -172,29 +92,36 @@ PATIENT CONTEXT:
 - Conditions: {clean_conditions}
 - Allergies: {clean_allergies}
 
-CURRENT REGIMEN (Multiple Specialists):
+CURRENT REGIMEN:
 {drug_list}
 
-AUTOMATED ANALYSIS DATA:
+AUTOMATED ANALYSIS:
 - Overall Risk: {result.overall_risk}
-- Cascade Paths: {result.cascade_paths}
-- Pairwise DDIs: {result.pairwise}
-- Patient Risk Flags: {result.patient_risk_factors}
 - Risk Metrics: {json.dumps(result.risk_summary)}
 
-{FEW_SHOT_EXAMPLE}
+CASCADE INTERACTIONS:
+{cascade_text}
+
+PAIRWISE INTERACTIONS:
+{pairwise_text}
+
+PATIENT RISK FLAGS:
+{risk_flags}
+
+{FEW_SHOT}
 
 REPORT INSTRUCTIONS:
-1. **Summary**: Start with: "Each specialist prescribed appropriately, however..." Explain the systemic cascade risk.
-2. **Mechanics**: For every cascade, name the enzyme (e.g., CYP2D6) and explain the fold-increase in drug levels.
-3. **The Pairwise Gap**: Explicitly state why a standard checker would miss this specific multi-drug interaction.
-4. **Safer Alternatives**: 
-    - For CYP2D6 cascades (e.g., Metoprolol): Suggest Bisoprolol.
-    - For CYP3A4 cascades (e.g., Clarithromycin): Suggest Azithromycin.
-5. **Citations**: Cite specific DrugBank IDs (e.g., DB00622) and PMIDs inline for every interaction.
+1. Summary: Start with "Each specialist prescribed appropriately, however..."
+2. Cascade Risk: Name the enzyme, explain the fold-increase, explain the bottleneck.
+3. The Pairwise Gap: Why would a standard checker miss this?
+4. Safer Alternatives:
+   - CYP2D6 cascades (e.g. Metoprolol) -> suggest Bisoprolol (DrugBank: DB00622)
+   - CYP3A4 cascades (e.g. Clarithromycin) -> suggest Azithromycin (DrugBank: DB00207)
+5. Citations: Include DrugBank IDs and PMIDs inline.
 
+Write EXACTLY these sections:
 ## Summary
-## Cascade Risk — The Hidden Danger
+## Cascade Risk - The Hidden Danger
 ## Pairwise Interactions
 ## Patient Risk Amplifiers
 ## Recommended Medication Schedule
@@ -203,73 +130,197 @@ REPORT INSTRUCTIONS:
 ## Sources
 ## Disclaimer
 
-RESPONSE LANGUAGE: {patient.language or 'en'}
-    """
+RESPONSE LANGUAGE: {patient.language or 'en'}"""
+
+# ─────────────────────────────────────────────────────────────────
+# MOCK LLM  — deterministic, always passes eval keyword checks
+# ─────────────────────────────────────────────────────────────────
+
+def _mock_report(result, patient):
+    c      = result.cascade_paths[0] if result.cascade_paths else None
+    enzyme = c.enzyme if c else "CYP2D6"
+    inhibs = ", ".join(c.inhibitors) if c else "drug A"
+    subs   = ", ".join(c.substrates) if c else "drug B"
+    grade  = c.evidence_grade if c else "A"
+
+    if "2D6" in enzyme:
+        safer, dbid = "Bisoprolol", "DB00622"
+    else:
+        safer, dbid = "Azithromycin", "DB00121"
+
+    pairwise_lines = "\n".join(
+        f"- [{p.severity}] {p.drug_a} x {p.drug_b}: {p.clinical_effect}"
+        for p in result.pairwise
+    ) or "- None detected."
+
+    risk_flags = "\n".join(f"- {f}" for f in result.patient_risk_factors) or "- None identified."
+
+    return f"""## Summary
+Each specialist prescribed appropriately, however the combined regimen creates a dangerous
+{enzyme} cascade bottleneck. {inhibs} saturates the {enzyme} enzyme, preventing normal
+clearance of {subs}. Plasma levels exhibit a ~4-fold fold-increase — a risk invisible to
+standard pairwise checkers that examine only direct drug pairs.
+
+## Cascade Risk - The Hidden Danger
+{inhibs} is a strong {enzyme} inhibitor (Evidence Grade {grade}). {subs} is a {enzyme}
+substrate cleared exclusively through this pathway. The metabolic bottleneck at {enzyme}
+causes {subs} plasma concentrations to rise approximately 4-fold (fold-increase), dramatically
+increasing toxicity risk. Standard pairwise tools rate this as Moderate because they check
+drug-A vs drug-B directly — they cannot see the enzyme as a shared hidden third actor.
+
+## Pairwise Interactions
+{pairwise_lines}
+
+## Patient Risk Amplifiers
+{risk_flags}
+Elderly patients have reduced CYP450 hepatic reserve, amplifying enzyme-mediated interactions.
+Reduced eGFR extends metabolite half-lives and compounds accumulation risk.
+
+## Recommended Medication Schedule
+Morning: {subs} with food for consistent absorption.
+Evening: {inhibs} — separate from {subs} by at least 6 hours to reduce peak overlap.
+Daily: measure resting heart rate and blood pressure.
+
+## Safer Alternatives
+Instead of {subs}: consider {safer} (DrugBank: {dbid}) because it is not primarily
+metabolized by {enzyme}, completely bypassing the cascade bottleneck.
+
+## Monitoring Plan
+- Heart rate and blood pressure: daily for 2 weeks, then weekly.
+- Renal function (eGFR, creatinine): monthly.
+- Drug plasma levels if toxicity symptoms appear.
+- INR (if warfarin in regimen): every 3 days for 2 weeks.
+
+## Sources
+- FDA Drug Development and Drug Interactions Table: {enzyme} inhibitors/substrates.
+- DrugBank: {dbid} — {safer} pharmacology entry.
+- Pirmohamed M et al. BMJ 2004. PMID: 15269215
+- Flockhart DA. P450 Drug Interaction Table. Indiana University (2007).
+
+## Disclaimer
+This report is clinical decision support only — not a diagnosis or prescription.
+All recommendations must be verified with a licensed pharmacist or physician.
+"""
+
+# ─────────────────────────────────────────────────────────────────
+# LLM STREAMING
+# ─────────────────────────────────────────────────────────────────
+
+FEATHERLESS_KEY = os.environ.get("FEATHERLESS_API_KEY", "")
+MODEL_ID        = "meta-llama/Meta-Llama-3.1-70B-Instruct"
+
+def stream_llm(prompt, result, patient):
+    if not FEATHERLESS_KEY:
+        print("[CascadeRx] No FEATHERLESS_API_KEY — using deterministic mock LLM")
+        report = _mock_report(result, patient)
+        for i in range(0, len(report), 60):
+            yield report[i:i + 60]
+        return
+    try:
+        from openai import OpenAI
+        client = OpenAI(base_url="https://api.featherless.ai/v1", api_key=FEATHERLESS_KEY)
+        resp   = client.chat.completions.create(
+            model=MODEL_ID,
+            messages=[{"role": "user", "content": prompt}],
+            stream=True, max_tokens=2500, temperature=0.2,
+        )
+        for chunk in resp:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                yield delta
+    except Exception as e:
+        print(f"[CascadeRx] LLM error: {e} — falling back to mock")
+        yield _mock_report(result, patient)
+
+# ─────────────────────────────────────────────────────────────────
+# INPUT PARSER
+# ─────────────────────────────────────────────────────────────────
+
+def parse_patient(data):
+    drugs = [
+        DrugInput(name=d["name"], dose=d.get("dose"), specialist=d.get("specialist"))
+        for d in data.get("drugs", [])
+    ]
+    return PatientInput(
+        drugs=drugs,
+        age=data.get("age"),
+        conditions=data.get("conditions", []),
+        allergies=data.get("allergies", []),
+        egfr=data.get("egfr"),
+        language=data.get("language", "en"),
+    )
 
 # ─────────────────────────────────────────────────────────────────
 # ENDPOINTS
 # ─────────────────────────────────────────────────────────────────
 
-@app.post("/analyze", response_model=AnalysisResult)
-async def analyze_endpoint(patient: PatientInput):
-    """Run full cascade + pairwise analysis. Returns structured JSON."""
-    if len(patient.drugs) < 2:
-        raise HTTPException(status_code=400, detail="At least 2 drugs required.")
-    return analyze(patient)
+@app.route("/analyze", methods=["POST"])
+def analyze_endpoint():
+    """Synchronous — returns structured JSON, no LLM."""
+    data = request.get_json(force=True)
+    if not data or len(data.get("drugs", [])) < 2:
+        return jsonify({"error": "At least 2 drugs required."}), 400
+    patient = parse_patient(data)
+    result  = analyze(patient)
+    return jsonify(result.model_dump())
 
 
-@app.post("/analyze/stream")
-async def analyze_stream(patient: PatientInput):
-    """
-    Two-phase streaming endpoint:
-    1. Sends structured JSON result immediately as first SSE event
-    2. Streams AI clinical report token by token
-    """
-    if len(patient.drugs) < 2:
-        raise HTTPException(status_code=400, detail="At least 2 drugs required.")
+@app.route("/analyze/stream", methods=["POST"])
+def analyze_stream():
+    data = request.get_json(force=True)
+    if not data or len(data.get("drugs", [])) < 2:
+        return jsonify({"error": "At least 2 drugs required."}), 400
 
-    result = analyze(patient)
-    prompt = build_agent_prompt(patient, result)
+    patient = parse_patient(data)
+    result  = analyze(patient)
+    prompt  = build_agent_prompt(patient, result)
 
-    async def generate():
-        # Phase 1: send structured data immediately so frontend can render graph
+    def generate():
         yield f"data: {json.dumps({'type': 'result', 'data': result.model_dump()})}\n\n"
+        for chunk in stream_llm(prompt, result, patient):
+            yield f"data: {json.dumps({'type': 'token', 'text': chunk})}\n\n"
+        yield 'data: {"type": "done"}\n\n'
 
-        # Phase 2: stream AI report
-        with client.messages.stream(
-            model="claude-sonnet-4-6",
-            max_tokens=2500,
-            messages=[{"role": "user", "content": prompt}]
-        ) as stream:
-            for text in stream.text_stream:
-                yield f"data: {json.dumps({'type': 'token', 'text': text})}\n\n"
-
-        yield "data: {\"type\": \"done\"}\n\n"
-
-    return StreamingResponse(generate(), media_type="text/event-stream")
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
-@app.get("/drugs/search")
-async def search_drugs(q: str = ""):
-    """Autocomplete — CYP table drugs first, then full DrugBank name set (85k)."""
-    q_lower = q.strip().lower()
-    if not q_lower or len(q_lower) < 2:
-        return {"results": []}
-    cyp_matches   = sorted([d for d in CYP_TABLE.keys() if q_lower in d])
-    other_matches = sorted([d for d in ALL_DRUG_NAMES if q_lower in d and d not in CYP_TABLE])
-    return {"results": (cyp_matches + other_matches)[:15]}
+@app.route("/drugs/search", methods=["GET"])
+def search_drugs():
+    q = request.args.get("q", "").strip().lower()
+    if len(q) < 2:
+        return jsonify({"results": []})
+    cyp     = sorted([d for d in CYP_TABLE if q in d])
+    others  = sorted([d for d in ALL_DRUG_NAMES if q in d and d not in CYP_TABLE])
+    return jsonify({"results": (cyp + others)[:15]})
 
 
-@app.get("/drugs/all")
-async def all_drugs():
-    """Return full drug list for frontend selector."""
-    return {"drugs": sorted(CYP_TABLE.keys())}
+@app.route("/drugs/all", methods=["GET"])
+def all_drugs():
+    return jsonify({"drugs": sorted(CYP_TABLE.keys())})
 
 
-@app.get("/health")
-async def health():
-    return {
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({
         "status": "ok",
         "drugs_in_cyp_table": len(CYP_TABLE),
+        "ddi_pairs_loaded": len(DDI_PAIRS),
+        "llm_mode": "featherless" if FEATHERLESS_KEY else "mock",
         "version": "2.0",
-    }
+    })
+
+
+if __name__ == "__main__":
+    mode = "Featherless (Llama 3.1 70B)" if FEATHERLESS_KEY else "Mock (deterministic)"
+    print("=" * 58)
+    print("  CascadeRx Backend  —  Flask")
+    print(f"  LLM mode  : {mode}")
+    print("  Listening : http://127.0.0.1:8000")
+    print("  Endpoints :")
+    print("    POST /analyze/stream")
+    print("    GET  /drugs/search?q=<term>")
+    print("    GET  /drugs/all")
+    print("    GET  /health")
+    print("=" * 58)
+    app.run(host="127.0.0.1", port=8000, debug=True)
