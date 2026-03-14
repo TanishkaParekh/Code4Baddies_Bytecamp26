@@ -59,6 +59,42 @@ def _format_drug_label(ingredient: str, resolved_map: dict[str, ResolvedDrug]) -
     if r and r.brand.lower() != ingredient.lower():
         return f"{r.brand} ({ingredient})"
     return ingredient
+def generate_report_text(result):
+    text = f"Overall medication risk level is {result.overall_risk}. "
+
+    if result.pairwise:
+        text += "The following drug interactions were detected. "
+        for p in result.pairwise:
+            text += f"{p.drug_a} and {p.drug_b} have a {p.severity} interaction. "
+
+    if result.patient_risk_factors:
+        text += "Patient risk factors include. "
+        for f in result.patient_risk_factors:
+            text += f"{f}. "
+
+    return text
+from gtts import gTTS
+from flask import send_file
+import uuid
+
+@app.post("/analyze/voice")
+def analyze_voice():
+
+    data = request.json
+
+    patient = PatientInput(**data)
+
+    result = analyze(patient)
+
+    report_text = generate_report_text(result)
+
+    filename = f"voice_{uuid.uuid4()}.mp3"
+
+    tts = gTTS(report_text, lang="en")
+
+    tts.save(filename)
+
+    return send_file(filename, mimetype="audio/mpeg")    
 
 
 def build_agent_prompt(patient, result, resolved_list: list[ResolvedDrug] = None):
