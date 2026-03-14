@@ -38,6 +38,40 @@ from drug_resolver import (
 
 app = Flask(__name__)
 
+@app.route("/library/drug")
+def drug_library():
+
+    q = request.args.get("q","").strip().lower()
+
+    if not q:
+        return jsonify({"error":"drug name required"}),400
+
+    info = {}
+
+    # CYP enzyme data
+    if q in CYP_TABLE:
+        info["enzymes"] = CYP_TABLE[q]
+
+    # pairwise interactions
+    interactions = []
+
+    for pair,data in DDI_PAIRS.items():
+
+        if q in pair:
+            other = [d for d in pair if d != q][0]
+
+            interactions.append({
+                "drug": other,
+                "severity": data["severity"],
+                "effect": data["clinical_effect"]
+            })
+
+    info["known_interactions"] = interactions[:10]
+
+    return jsonify({
+        "drug": q,
+        "library": info
+    })
 # ─────────────────────────────────────────────────────────────────
 # PHI SCRUBBER
 # ─────────────────────────────────────────────────────────────────
